@@ -1,0 +1,290 @@
+#!/bin/bash
+
+# Если скрипт не запущен от имени root, повторно запускаем его через sudo.
+if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+# Добавим в PATH /opt/homebrew/bin на случай, если tunblkctl и oathtool установлены через Homebrew на Apple Silicon
+export PATH="/opt/homebrew/bin:$PATH"
+
+# Цвета для вывода
+GREEN="\033[32m"
+NC="\033[0m"   # Сброс цвета
+
+# Файл для хранения 2FA записей
+TWOFA_FILE="/usr/local/etc/mbh_2fa"
+# Создаём директорию и файл, если их нет, и ограничиваем права
+mkdir -p "$(dirname "$TWOFA_FILE")"
+touch "$TWOFA_FILE"
+chmod 600 "$TWOFA_FILE"
+
+# Функция вывода меню
+print_menu() {
+  echo "Меню утилиты mbh:"
+  echo "----------------------"
+  echo "1. Очистка кеша"
+  echo "2. 2FA меню"
+  echo "3. Подключение к VPN через tunblkctl"
+  echo "9. Добавление 2FA кода в 2FA меню"
+  echo "0. Выход"
+  echo "----------------------"
+}
+
+# Функция очистки кеша
+clear_cache() {
+    echo "Очищаем кеш..."
+    
+    dscacheutil -flushcache
+    FLUSH_STATUS=$?
+    if [ $FLUSH_STATUS -eq 0 ]; then
+        echo "Команда 'dscacheutil -flushcache' выполнена успешно."
+    else
+        echo "Ошибка при выполнении 'dscacheutil -flushcache' (код ошибки: $FLUSH_STATUS)."
+    fi
+
+    killall -HUP mDNSResponder
+    KILL_STATUS=$?
+    if [ $KILL_STATUS -eq 0 ]; then
+        echo "Команда 'killall -HUP mDNSResponder' выполнена успешно."
+    else
+        echo "Ошибка при выполнении 'killall -HUP mDNSResponder' (код ошибки: $KILL_STATUS)."
+    fi
+
+    if [ $FLUSH_STATUS -eq 0 ] && [ $KILL_STATUS -eq 0 ]; then
+        echo "Кеш успешно очищен."
+    else
+        echo "При очистке кеша произошли ошибки."
+    fi
+}
+
+# Функция для вывода 2FA меню и копирования кода
+show_2fa_menu() {
+    if [ ! -s "$TWOFA_FILE" ]; then
+        echo "Список 2FA пуст."
+        return
+    fi
+
+    echo "Список 2FA:"
+    local i=1
+    while IFS=: read -r name secret; do
+        echo "$i. $name"
+        i=$((i+1))
+    done < "$TWOFA_FILE"
+    
+    read -p "Выберите номер записи для копирования кода (или 0 для выхода): " selection
+    if [ "$selection" -eq 0 ]; then
+        return
+    fi
+    
+    local selected_line
+    selected_line=$(sed -n "${selection}p" "$TWOFA_FILE")
+    if [ -z "$selected_line" ]; then
+        echo "Неверный выбор."
+        return
+    fi
+    local name
+    name=$(echo "$selected_line" | cut -d: -f1)
+    local secret
+    secret=$(echo "$selected_line" | cut -d: -f2)
+    
+    if ! command -v oathtool >/dev/null; then
+       echo "oathtool не установлен. Установите его (например, через brew: brew install oath-toolkit) для генерации 2FA кодов."
+       return
+    fi
+
+    local code
+    code=$(oathtool --totp -b "$secret")
+    if [ $? -eq 0 ]; then
+        echo -n "$code" | pbcopy
+        echo "2FA код для '$name' скопирован в буфер обмена."
+    else
+        echo "Ошибка при генерации 2FA кода."
+    fi
+}
+
+# Функция для добавления 2FA кода
+add_2fa_entry() {
+    read -p "Введите секрет для 2FA: " secret
+    read -p "Введите название для 2FA кода: " name
+    if [ -z "$secret" ] || [ -z "$name" ]; then
+        echo "Секрет и название не могут быть пустыми."
+        return
+    fi
+    echo "$name:$secret" >> "$TWOFA_FILE"
+    if [ $? -eq 0 ]; then
+       echo "2FA код для '$name' успешно добавлен."
+    else
+       echo "Ошибка при добавлении 2FA кода."
+    fi
+}
+
+# Функция, возвращающая (в виде списка через пробел) все VPN, которые раскрашены в зелёный в выводе tunblkctl st
+# (то есть подключённые)
+get_connected_vpn_names() {
+    # Используем 'script -q /dev/null' для захвата escape-последовательностей (цветов)
+    # Ищем только строки, содержащие зелёный цвет $'\033[32m'
+    local lines
+    lines="$(script -q /dev/null tunblkctl st 2>/dev/null | grep -F $'\033[32m')"
+    
+    local result=()
+    while IFS= read -r line; do
+        # Удаляем управляющие последовательности (цвета), чтобы корректно извлечь имя
+        local no_color
+        # sed-выражение для удаления ESC-последовательностей
+        no_color="$(echo "$line" | sed -E 's/\x1B\[[0-9;]*m//g')"
+        # Первое "слово" в строке — имя VPN
+        local name
+        name="$(echo "$no_color" | awk '{print $1}')"
+        if [ -n "$name" ]; then
+            result+=("$name")
+        fi
+    done <<< "$lines"
+
+    # Выводим имена через пробел
+    echo "${result[@]}"
+}
+
+# Пункт меню 3: Подключение к VPN
+connect_vpn() {
+    echo "Получение списка VPN подключений..."
+
+    # Проверяем наличие команды tunblkctl
+    if ! command -v tunblkctl >/dev/null; then
+        echo "tunblkctl не установлен или не найден в PATH."
+        return
+    fi
+
+    # Получаем список всех VPN (tunblkctl list)
+    local vpn_list
+    vpn_list="$(tunblkctl list)"
+    if [ -z "$vpn_list" ]; then
+        echo "Нет доступных VPN подключений (tunblkctl list пуст)."
+        return
+    fi
+
+    # Получаем список подключённых VPN (по цвету в tunblkctl st)
+    local connected_list
+    connected_list="$(get_connected_vpn_names)"
+
+    # Разбиваем vpn_list в массив connections
+    local i=0
+    declare -a connections
+    for c in $vpn_list; do
+        i=$((i+1))
+        connections[$i]="$c"
+    done
+
+    # Выводим список с учётом подключённости (зелёный цвет)
+    echo "Список VPN подключений:"
+    for (( idx=1; idx<=i; idx++ )); do
+        local conn_name="${connections[$idx]}"
+
+        # Если conn_name есть в connected_list, считаем VPN подключённым
+        if [[ " $connected_list " =~ " $conn_name " ]]; then
+            echo -e "$idx. ${GREEN}${conn_name}${NC} (подключён)"
+        else
+            echo "$idx. $conn_name"
+        fi
+    done
+
+    echo ""
+    read -p "Выберите номер подключения (или 0 для отмены): " vpn_selection
+    if [ "$vpn_selection" -eq 0 ]; then
+        return
+    fi
+
+    if [ "$vpn_selection" -lt 1 ] || [ "$vpn_selection" -gt "$i" ]; then
+        echo "Неверный выбор."
+        return
+    fi
+
+    local chosen_connection="${connections[$vpn_selection]}"
+    echo "Вы выбрали: $chosen_connection"
+
+    # Проверяем, подключён ли уже выбранный VPN
+    if [[ " $connected_list " =~ " $chosen_connection " ]]; then
+        # Уже подключён — делаем disconnect
+        echo "Отключение VPN: $chosen_connection"
+        tunblkctl disconnect "$chosen_connection"
+        if [ $? -eq 0 ]; then
+            echo "VPN '$chosen_connection' успешно отключён."
+        else
+            echo "Ошибка при отключении VPN '$chosen_connection'."
+        fi
+    else
+        # Не подключён — делаем connect с 2FA-кодом (если есть)
+        echo "Подключение к VPN: $chosen_connection"
+
+        # Копируем 2FA код с именем 'vpn' (если такая запись есть)
+        if [ -s "$TWOFA_FILE" ]; then
+            local vpn_entry
+            vpn_entry=$(grep '^vpn:' "$TWOFA_FILE")
+            if [ -n "$vpn_entry" ]; then
+                local vpn_secret
+                vpn_secret=$(echo "$vpn_entry" | cut -d: -f2)
+                if command -v oathtool >/dev/null; then
+                    local vpn_code
+                    vpn_code=$(oathtool --totp -b "$vpn_secret")
+                    if [ $? -eq 0 ]; then
+                        echo -n "$vpn_code" | pbcopy
+                        echo "2FA код для 'vpn' скопирован в буфер обмена."
+                    else
+                        echo "Ошибка при генерации 2FA кода для 'vpn'."
+                    fi
+                else
+                    echo "oathtool не установлен. Установите его для генерации 2FA кода."
+                fi
+            else
+                echo "В 2FA списке нет записи с именем 'vpn'."
+            fi
+        else
+            echo "Файл 2FA пуст. Добавьте запись 'vpn' через пункт 9 (при необходимости)."
+        fi
+
+        # Выполняем команду подключения
+        tunblkctl connect --wait "$chosen_connection"
+        if [ $? -eq 0 ]; then
+            echo "Подключение к VPN '$chosen_connection' выполнено успешно."
+        else
+            echo "Ошибка при подключении к VPN '$chosen_connection'."
+        fi
+    fi
+
+    echo ""
+    echo "Текущий статус (tunblkctl st):"
+    tunblkctl st
+}
+
+# Основной цикл программы
+while true; do
+    clear
+    print_menu
+    echo ""
+    read -p "Выберите пункт меню: " choice
+    echo ""
+    case $choice in
+        1)
+            clear_cache
+            ;;
+        2)
+            show_2fa_menu
+            ;;
+        3)
+            connect_vpn
+            ;;
+        9)
+            add_2fa_entry
+            ;;
+        0)
+            echo "Выход..."
+            exit 0
+            ;;
+        *)
+            echo "Неверный выбор. Попробуйте снова."
+            ;;
+    esac
+    echo ""
+    read -n 1 -s -r -p "Нажмите любую клавишу для продолжения..."
+done
+
