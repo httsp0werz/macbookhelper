@@ -26,7 +26,7 @@ MBH — это CLI утилита для macOS, объединяющая фун�
 ### Однострочник для установки
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yourusername/mbh/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/httsp0werz/macbookhelper/main/install.sh | bash
 ```
 
 *Замените `yourusername` на ваше имя пользователя в GitHub.*
@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/yourusername/mbh/main/install.sh | 
 
 1. Клонируйте репозиторий:
    ```bash
-   git clone https://github.com/yourusername/mbh.git
+   git clone https://github.com/httsp0werz/macbookhelper/mbh.git
    cd mbh
    ```
 2. Запустите скрипт установки:
